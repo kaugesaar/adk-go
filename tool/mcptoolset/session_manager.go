@@ -210,17 +210,7 @@ type headerTransport struct {
 
 // RoundTrip adds the configured headers to the request.
 func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	reqBodyClosed := false
-	if req.Body != nil {
-		defer func() {
-			if !reqBodyClosed {
-				req.Body.Close()
-			}
-		}()
-	}
-
 	if len(t.Headers) == 0 {
-		reqBodyClosed = true
 		return t.base().RoundTrip(req)
 	}
 
@@ -228,8 +218,6 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	for key, value := range t.Headers {
 		req2.Header.Set(key, value)
 	}
-
-	reqBodyClosed = true
 	return t.base().RoundTrip(req2)
 }
 

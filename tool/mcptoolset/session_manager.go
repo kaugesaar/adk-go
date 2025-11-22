@@ -28,6 +28,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+const defaultSessionKey = "default"
+
 // sessionManager manages MCP client sessions with header-based pooling
 type sessionManager struct {
 	client    *mcp.Client
@@ -67,10 +69,10 @@ func (sm *sessionManager) generateSessionKey(headers map[string]string) string {
 	// For non-HTTP transports (e.g., stdio, in-memory), headers don't apply,
 	// so we always pool into the same session.
 	if !sm.headersAffectSession() {
-		return "default"
+		return defaultSessionKey
 	}
 	if len(headers) == 0 {
-		return "default"
+		return defaultSessionKey
 	}
 
 	keys := make([]string, 0, len(headers))

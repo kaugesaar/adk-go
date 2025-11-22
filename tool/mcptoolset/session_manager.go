@@ -94,14 +94,11 @@ func (sm *sessionManager) GetSession(ctx context.Context, headers map[string]str
 	key := sm.generateSessionKey(headers)
 
 	sm.mu.RLock()
-	if entry, ok := sm.sessions[key]; ok {
-		if sm.isSessionValid(ctx, entry.session) {
-			sm.mu.RUnlock()
-			return entry.session, nil
-		}
-		sm.mu.RUnlock()
-	} else {
-		sm.mu.RUnlock()
+	entry, ok := sm.sessions[key]
+	sm.mu.RUnlock()
+
+	if ok && sm.isSessionValid(ctx, entry.session) {
+		return entry.session, nil
 	}
 
 	sm.mu.Lock()

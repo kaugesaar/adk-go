@@ -1,0 +1,225 @@
+// Copyright 2025 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package mcptoolset
+
+import (
+	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// SessionManager manages MCP client sessions with header-based pooling
+type SessionManager struct {
+	client    *mcp.Client
+	transport mcp.Transport
+
+	mu       sync.RWMutex
+	sessions map[string]*sessionEntry
+}
+
+type sessionEntry struct {
+	session *mcp.ClientSession
+	headers map[string]string
+}
+
+// NewSessionManager creates a new session manager
+func NewSessionManager(client *mcp.Client, transport mcp.Transport) *SessionManager {
+	return &SessionManager{
+		client:    client,
+		transport: transport,
+		sessions:  make(map[string]*sessionEntry),
+	}
+}
+
+// generateSessionKey creates a hash-based key from headers
+func (sm *SessionManager) generateSessionKey(headers map[string]string) string {
+	if len(headers) == 0 {
+		return "default"
+	}
+
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var pairs []string
+	for _, k := range keys {
+		pairs = append(pairs, fmt.Sprintf("%q:%q", k, headers[k]))
+	}
+	jsonStr := "{" + strings.Join(pairs, ",") + "}"
+
+	h := md5.Sum([]byte(jsonStr))
+	return hex.EncodeToString(h[:])
+}
+
+// GetSession returns a session for the given headers, creating if necessary
+func (sm *SessionManager) GetSession(ctx context.Context, headers map[string]string) (*mcp.ClientSession, error) {
+	key := sm.generateSessionKey(headers)
+
+	sm.mu.RLock()
+	if entry, ok := sm.sessions[key]; ok {
+		if sm.isSessionValid(ctx, entry.session) {
+			sm.mu.RUnlock()
+			return entry.session, nil
+		}
+		sm.mu.RUnlock()
+	} else {
+		sm.mu.RUnlock()
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if entry, ok := sm.sessions[key]; ok && sm.isSessionValid(ctx, entry.session) {
+		return entry.session, nil
+	}
+
+	wrappedTransport := sm.wrapTransportWithHeaders(headers)
+
+	session, err := sm.client.Connect(ctx, wrappedTransport, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
+
+	sm.sessions[key] = &sessionEntry{
+		session: session,
+		headers: headers,
+	}
+
+	return session, nil
+}
+
+// isSessionValid checks if a session is still usable
+func (sm *SessionManager) isSessionValid(ctx context.Context, session *mcp.ClientSession) bool {
+	if session == nil {
+		return false
+	}
+
+	pingCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		pingCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+	}
+
+	if err := session.Ping(pingCtx, nil); err != nil {
+		return false
+	}
+	return true
+}
+
+// wrapTransportWithHeaders creates a transport that injects headers
+func (sm *SessionManager) wrapTransportWithHeaders(headers map[string]string) mcp.Transport {
+	switch t := sm.transport.(type) {
+
+	case *mcp.SSEClientTransport:
+		return &mcp.SSEClientTransport{
+			Endpoint:   t.Endpoint,
+			HTTPClient: wrapHTTPClient(t.HTTPClient, headers),
+		}
+
+	case *mcp.StreamableClientTransport:
+		return &mcp.StreamableClientTransport{
+			Endpoint:   t.Endpoint,
+			HTTPClient: wrapHTTPClient(t.HTTPClient, headers),
+		}
+
+	default:
+		return sm.transport
+	}
+}
+
+func wrapHTTPClient(httpClient *http.Client, headers map[string]string) *http.Client {
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
+
+	return &http.Client{
+		Transport: &headerTransport{
+			Base:    httpClient.Transport,
+			Headers: headers,
+		},
+		CheckRedirect: httpClient.CheckRedirect,
+		Jar:           httpClient.Jar,
+		Timeout:       httpClient.Timeout,
+	}
+}
+
+// Close closes all sessions
+func (sm *SessionManager) Close() error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	var errs []error
+	for _, entry := range sm.sessions {
+		if err := entry.session.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	sm.sessions = make(map[string]*sessionEntry)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors closing sessions: %v", errs)
+	}
+	return nil
+}
+
+// headerTransport that uses fixed headers instead of context
+type headerTransport struct {
+	Base    http.RoundTripper
+	Headers map[string]string
+}
+
+// RoundTrip adds the configured headers to the request.
+func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	reqBodyClosed := false
+	if req.Body != nil {
+		defer func() {
+			if !reqBodyClosed {
+				req.Body.Close()
+			}
+		}()
+	}
+
+	if len(t.Headers) == 0 {
+		reqBodyClosed = true
+		return t.base().RoundTrip(req)
+	}
+
+	req2 := req.Clone(req.Context())
+	for key, value := range t.Headers {
+		req2.Header.Set(key, value)
+	}
+
+	reqBodyClosed = true
+	return t.base().RoundTrip(req2)
+}
+
+func (t *headerTransport) base() http.RoundTripper {
+	if t.Base != nil {
+		return t.Base
+	}
+	return http.DefaultTransport
+}
